@@ -27,11 +27,13 @@ SUCCESS = 'success'
 BLUNDER = 'blunder'
 NEXT_IDX = 'next_idx'
 MID = 'MID'
-
+# randomized election timeout bounds
 LOW_ELECTION = 200  # secs
 HIGH_ELECTION = 300  # secs
+
 HEARTBEAT = 170 / 1000
 
+# max number of messages sent in a AppendRPC
 NUM_BUFFER = 114
 
 
@@ -65,6 +67,7 @@ class Replica:
         self.socket.sendto(json.dumps(message).encode(
             'utf-8'), ('localhost', self.port))
 
+    # sends an Append RPC to the given receiver
     def send_append_rpc(self, receiver: str):
         assert self.state == ReplicaState.LEADER
         other_next_idx = self.next_indices[receiver]
@@ -86,6 +89,7 @@ class Replica:
         }
         self.send(msg_body)
 
+    # handles put requests
     def put(self, message: json):
         if (self.state == ReplicaState.FOLLOWER):
             # send a redirect message to the source of the message
@@ -97,47 +101,31 @@ class Replica:
                 "MID": message["MID"]
             }
             self.send(msg_body)
+
         elif (self.state == ReplicaState.CANDIDATE):
-            # TODO: decide what to do here
-            # msg_body = {
-            #     "src": self.id,
-            #     "dst": message["src"],
-            #     "leader": self.leader,
-            #     "type": "fail",
-            #     "MID": message["ID"]
-            # }
-            # self.send(msg_body)
             self.unprocessed_requests.append(message)
+
         elif self.state == ReplicaState.LEADER:
             # leader
             if self.id != self.leader:
                 raise Exception("leader is not current id! check!")
             entry = [(self.term), (message["key"], message["value"])]
             self.logs.append(entry)
-            # TODO: send append RPC's to each replica with our assumption of their next index
-            # and send in logs everything from idx to length of our log.
             for other in self.others:
                 self.send_append_rpc(other)
 
             self.unacked_puts.append((len(self.logs)-1, message))
 
+    # resests election timer for the replica
     def reset_election_timer(self):
         election_timeout = random.randint(
             LOW_ELECTION, HIGH_ELECTION) / 1000  # in secs
         self.timer = Timer(election_timeout)
 
-    # def index_at_quorum(self, index) -> bool:
-    #     # num_acked = 0
-    #     # for next_idx in self.next_indices.values():
-    #     #     if index > next_idx:
-    #     #         num_acked += 1
-    #     # return num_acked >= len(self.others) // 2
-    #     return
-
+    # searches the committed elements in the log
+    # to answer the given message
     def search_logs(self, message):
         key = message["key"]
-        print("LOOKING FOR", key)
-
         KEY = 0
         VALUE = 1
         for i in range(len(self.logs)-len(self.unacked_puts)-1, -1, -1):
@@ -146,8 +134,10 @@ class Replica:
             if log_entry[1][KEY] == key:
                 return log_entry[1][VALUE]
 
+        # when the value is not in logs
         return ""
 
+    # handles get requests from the user
     def get(self, message):
         if (self.state == ReplicaState.FOLLOWER):
             # send a redirect message to the source of the message
@@ -178,6 +168,7 @@ class Replica:
             }
             self.send(msg_body)
 
+    # sends request Vote RPC's when election timer goes off
     def send_req_vote_rps(self):
         msg_body = {
             "src": self.id,
@@ -190,8 +181,7 @@ class Replica:
         }
         self.send(msg_body)
 
-    # votes only if the replica is a follower
-
+    # handles voting when receives a ReqVote RPC
     def vote(self, message: dict):
         if self.state != ReplicaState.FOLLOWER:
             raise Exception("Non follower state trying to vote")
@@ -205,8 +195,6 @@ class Replica:
             return
 
         self.leader = BROADCAST
-        # TODO: check if the message's logs are atleast as
-        # up to date as self.logs
         candidate_len_logs = message[ENTRY][0]
         candidate_last_msg_term = message[ENTRY][1]
 
@@ -226,6 +214,7 @@ class Replica:
         self.send(msg_body)
         self.voted_in_curr_term = True
 
+    # updates own logs based on recieved AppendRPC message
     def update_log(self, message):
         assert self.state == ReplicaState.FOLLOWER
         # If our term at the entry's index, matches the entry's term. Wipe everythign greater than the entry's index and repalce it with the given logs. Otherwise scream.
@@ -257,6 +246,7 @@ class Replica:
             }
             self.send(msg_body)
 
+    # initialize self to leader when recievced a quorum
     def initialize_leader(self):
         self.state = ReplicaState.LEADER
         self.timer = Timer(HEARTBEAT)
@@ -288,6 +278,8 @@ class Replica:
 
         return num_acked >= (len(self.others) // 2)
 
+    # handles successful Append RPC (as a leader)
+    # sends next batch of information for replicas that are not up to date
     def handle_success(self, msg):
         assert self.state == ReplicaState.LEADER
         other = msg["src"]
@@ -296,13 +288,15 @@ class Replica:
         if (msg[NEXT_IDX] < len(self.logs)):
             self.send_append_rpc(other)
 
+    # handles blunder messages from replicas and resends AppendRPCs
     def handle_blunder(self, msg):
         assert self.state == ReplicaState.LEADER
         other = msg["src"]
-        assert self.next_indices[other] > 1
+        assert self.next_indices[other] >= 1
         self.next_indices[other] -= 1
         self.send_append_rpc(other)
 
+    # sends ok messages to the user when message has been successfully put(or committed)
     def send_ok_message(self, message):
         msg_body = {
             "src": self.id,
@@ -313,6 +307,8 @@ class Replica:
         }
         self.send(msg_body)
 
+    # replica runs for office when election timer goes off and has not heard from
+    # a leader
     def run_for_office(self):
         self.term += 1
         print("RUNNING FOR OFFICE AT TERM", self.term)
@@ -354,6 +350,7 @@ class Replica:
         assert collected_votes >= (len(self.others) // 2) + 1
         self.initialize_leader()
 
+    # sends fail unprocessed messages when fails to gain quorum of put messages
     def fail_unacked_puts(self):
         for msg in self.unacked_puts:
             # send failed ack
@@ -368,11 +365,9 @@ class Replica:
         self.unacked_puts = []
         return
 
+    # starts the replica
     def run(self):
         while True:
-            # print("LEADER FOR ", self.id, "is: ", self.leader)
-            # print("current term ", self.term, "state", self.state)
-            # print("OTHERS", self.others)
             if self.timer.is_done():
                 print("timer is done for", self.id)
                 if self.state == ReplicaState.LEADER:
